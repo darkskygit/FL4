@@ -187,14 +187,22 @@ pub extern "C" fn fl4_boot(off: u64, el_mode: u64) -> ! {
     // RAM in the window: everything the memory map calls write-back memory.
     let mut ram = Ranges::new();
     let mut usable = Ranges::new();
+    let mut zeroed = Ranges::new();
     for e in &bi.mmap[..(bi.n_mmap as usize).min(fl4_bootinfo::MAX_MMAP)] {
         let Some((start, end)) = bootmem::entry_pages(e.base, e.len, PADDR_TOP.min(pa_top)) else { continue };
-        if e.cacheable != 0 && (e.kind == mem::FREE || e.kind == mem::FIRMWARE) {
+        let wb = e.cacheable & 1 != 0;
+        if wb && (e.kind == mem::FREE || e.kind == mem::FIRMWARE) {
             ram.add(start, end);
         }
-        if e.cacheable != 0 && e.kind == mem::FREE {
+        if wb && e.kind == mem::FREE {
             usable.add(start, end);
+            if e.cacheable & mem::ZEROED != 0 {
+                zeroed.add(start, end);
+            }
         }
+    }
+    if zeroed.lost {
+        zeroed = Ranges::new();
     }
     // RAM a full list left out would go to user space as device memory,
     // or be handed out as free memory the window does not map.
@@ -510,11 +518,16 @@ pub extern "C" fn fl4_boot(off: u64, el_mode: u64) -> ! {
     let mut free = usable;
     free.remove(bi.region_paddr, bi.region_paddr + bi.region_len);
     free.remove(root.p_start, root.p_end);
+    zeroed.remove(bi.region_paddr, bi.region_paddr + bi.region_len);
+    zeroed.remove(root.p_start, root.p_end);
     let mut mods = [fl4_bootinfo::Module::default(); fl4_bootinfo::MAX_MODULES];
     let n_mods = (bi.n_modules as usize).min(fl4_bootinfo::MAX_MODULES);
     for i in 0..n_mods {
         let m = bi.modules[i];
-        free.remove(m.paddr & !(PAGE - 1), (m.paddr + m.size + PAGE - 1) & !(PAGE - 1));
+        let m_start = m.paddr & !(PAGE - 1);
+        let m_end = (m.paddr + m.size + PAGE - 1) & !(PAGE - 1);
+        free.remove(m_start, m_end);
+        zeroed.remove(m_start, m_end);
     }
     // The TPM event log the loader copied: whole pages of free RAM clear
     // of the kernel region, the root task and the modules, or none.
@@ -526,7 +539,9 @@ pub extern "C" fn fl4_boot(off: u64, el_mode: u64) -> ! {
         }
     }
     if let Some(t) = &tpm {
-        free.remove(t.paddr, t.paddr + t.size.div_ceil(PAGE) * PAGE);
+        let t_end = t.paddr + t.size.div_ceil(PAGE) * PAGE;
+        free.remove(t.paddr, t_end);
+        zeroed.remove(t.paddr, t_end);
     }
     let mut dev = Ranges::new();
     dev.add(0, pa_top);
@@ -579,6 +594,7 @@ pub extern "C" fn fl4_boot(off: u64, el_mode: u64) -> ! {
         match pool.take(size + 0x1_0000) {
             Some(p) => {
                 free.remove(p, p + size + 0x1_0000);
+                zeroed.remove(p, p + size + 0x1_0000);
                 let mem = (p + 0xffff) & !0xffff;
                 let gicr_pa = |c: usize| {
                     let va = percpu::gicr(c);
@@ -610,13 +626,20 @@ pub extern "C" fn fl4_boot(off: u64, el_mode: u64) -> ! {
     // Not over the device tree it copies (which may be in free memory).
     let mut pool = free;
     if dtb_len != 0 {
-        pool.remove(bi.dtb & !(PAGE - 1), (bi.dtb + dtb_len + PAGE - 1) & !(PAGE - 1));
+        let dtb_start = bi.dtb & !(PAGE - 1);
+        let dtb_end = (bi.dtb + dtb_len + PAGE - 1) & !(PAGE - 1);
+        pool.remove(dtb_start, dtb_end);
+        zeroed.remove(dtb_start, dtb_end);
     }
     let extra_pa = match pool.take(extra_size) {
         Some(p) => p,
         None => fail("no memory for the extra BootInfo"),
     };
     free.remove(extra_pa, extra_pa + extra_size);
+    zeroed.remove(extra_pa, extra_pa + extra_size);
+    if zeroed.lost {
+        zeroed = Ranges::new();
+    }
     let extra = unsafe { core::slice::from_raw_parts_mut(pptr(extra_pa) as *mut u8, extra_size as usize) };
     let extra_len = build_extra_bi(extra, &h, bi.dtb, dtb_len, &mods[..extra_mods], tpm.as_ref(), msi.as_ref());
     // The boot frames go after the image in user space (fl4-core
@@ -633,6 +656,8 @@ pub extern "C" fn fl4_boot(off: u64, el_mode: u64) -> ! {
     let mut p = BootParams {
         free: [Region::EMPTY; MAX_REGIONS],
         n_free: 0,
+        zeroed: [Region::EMPTY; MAX_REGIONS],
+        n_zeroed: 0,
         device: [Region::EMPTY; MAX_REGIONS],
         n_device: 0,
         ui_p_start: root.p_start,
@@ -670,6 +695,12 @@ pub extern "C" fn fl4_boot(off: u64, el_mode: u64) -> ! {
     for i in 0..free.n {
         p.free[i] = Region { start: pptr(free.r[i].start), end: pptr(free.r[i].end) };
         p.n_free += 1;
+    }
+    if zeroed.n <= MAX_REGIONS {
+        for i in 0..zeroed.n {
+            p.zeroed[i] = Region { start: pptr(zeroed.r[i].start), end: pptr(zeroed.r[i].end) };
+            p.n_zeroed += 1;
+        }
     }
     for i in 0..dev.n.min(MAX_REGIONS) {
         p.device[i] = dev.r[i];

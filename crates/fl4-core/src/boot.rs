@@ -45,6 +45,10 @@ pub struct BootParams {
     /// overlapping the kernel, the boot modules or the root task image.
     pub free: [Region; MAX_REGIONS],
     pub n_free: u64,
+    /// Sub-ranges of free RAM (kernel virtual addresses), sorted, page
+    /// aligned, that the loader guarantees are already zeroed.
+    pub zeroed: [Region; MAX_REGIONS],
+    pub n_zeroed: u64,
     /// Physical ranges given out as device untypeds, sorted.
     pub device: [Region; MAX_REGIONS],
     pub n_device: u64,
@@ -225,7 +229,15 @@ fn create_frames<S: Store>(s: &mut S, b: &mut Boot, reg: Region, pml4: u64, pv_o
     (before, b.slot_pos)
 }
 
-fn create_untypeds_for_region<S: Store>(s: &mut S, b: &mut Boot, device: bool, reg: Region, first: u64) {
+fn create_untypeds_for_region<S: Store>(
+    s: &mut S,
+    b: &mut Boot,
+    device: bool,
+    reg: Region,
+    first: u64,
+    zeroed: &[Region; MAX_REGIONS],
+    n_zeroed: u64,
+) {
     let mut start = reg.start;
     // Each round takes the largest aligned block at `start`, so a region
     // splits into at most 128 blocks; the fuel makes that bound explicit.
@@ -255,14 +267,14 @@ fn create_untypeds_for_region<S: Store>(s: &mut S, b: &mut Boot, device: bool, r
             if i < MAX_BOOTINFO_UNTYPEDS {
                 bi_set(s, b, bi::UNTYPED_LIST + 2 * i, paddr);
                 bi_set(s, b, bi::UNTYPED_LIST + 2 * i + 1, desc);
-                provide_untyped(s, b, device, start, size_bits);
+                provide_untyped(s, b, device, start, size_bits, zeroed, n_zeroed);
             } else if b.extra_ut != 0 && i - MAX_BOOTINFO_UNTYPEDS < EXTRA_UNTYPEDS {
                 // l4h 0047: the descriptor goes in the extra chunk, after
                 // its 16-byte header.
                 let e = b.extra_ut.wrapping_add(16).wrapping_add((i - MAX_BOOTINFO_UNTYPEDS).wrapping_mul(16));
                 s.write(e, paddr);
                 s.write(e.wrapping_add(8), desc);
-                provide_untyped(s, b, device, start, size_bits);
+                provide_untyped(s, b, device, start, size_bits, zeroed, n_zeroed);
             } else if EXTRA_UNTYPEDS > 0 {
                 b.ut_lost = true;
             }
@@ -317,32 +329,67 @@ fn create_device_untypeds<S: Store>(s: &mut S, b: &mut Boot, reg: Region, kernel
 fn create_device_untypeds_image<S: Store>(s: &mut S, b: &mut Boot, reg: Region, kernel: Region, first: u64) {
     let cut_start = layout::paddr(kernel.start);
     let cut_end = layout::paddr(kernel.end);
+    let no_zeroed = [Region::EMPTY; MAX_REGIONS];
     if cut_start >= cut_end {
-        create_untypeds_for_region(s, b, true, reg, first);
+        create_untypeds_for_region(s, b, true, reg, first, &no_zeroed, 0);
         return;
     }
     let below_end = if reg.end < cut_start { reg.end } else { cut_start };
-    create_untypeds_for_region(s, b, true, Region { start: reg.start, end: below_end }, first);
+    create_untypeds_for_region(s, b, true, Region { start: reg.start, end: below_end }, first, &no_zeroed, 0);
     let above_start = if reg.start > cut_end { reg.start } else { cut_end };
-    create_untypeds_for_region(s, b, true, Region { start: above_start, end: reg.end }, first);
+    create_untypeds_for_region(s, b, true, Region { start: above_start, end: reg.end }, first, &no_zeroed, 0);
 }
 
 /// The cap for the untyped at `start` (a kernel address for RAM, physical
 /// for devices).
-fn provide_untyped<S: Store>(s: &mut S, b: &mut Boot, device: bool, start: u64, size_bits: u64) {
+fn provide_untyped<S: Store>(
+    s: &mut S,
+    b: &mut Boot,
+    device: bool,
+    start: u64,
+    size_bits: u64,
+    zeroed: &[Region; MAX_REGIONS],
+    n_zeroed: u64,
+) {
     let ptr = if device { layout::pptr(start) } else { start };
     // Boot untypeds are clean (l4h 0019): RAM is cleared here so the free
     // index can start at 0.
     if !device {
-        clear_dirty(s, start, 1u64 << (size_bits & 63));
+        clear_dirty(s, start, 1u64 << (size_bits & 63), zeroed, n_zeroed);
     }
     provide_cap(s, b, Cap::Untyped { ptr, size_bits, free_index: 0, is_device: device });
+}
+
+fn is_prezeroed(zeroed: &[Region; MAX_REGIONS], n_zeroed: u64, start: u64, len: u64) -> bool {
+    let end = match start.checked_add(len) {
+        Some(e) => e,
+        None => return false,
+    };
+    let mut i: u64 = 0;
+    let mut found = false;
+    while i < n_zeroed && i < MAX_REGIONS as u64 {
+        let z = zeroed[i as usize];
+        if z.start <= start && end <= z.end {
+            found = true;
+        }
+        i += 1;
+    }
+    found
 }
 
 /// l4h 0019: clear the pages of [start, start + len) that hold a nonzero
 /// word and leave the others alone, so a hypervisor's shared zero pages
 /// stay shared. `len` is a power of two of at least 16 bytes.
-fn clear_dirty<S: Store>(s: &mut S, start: u64, len: u64) {
+fn clear_dirty<S: Store>(
+    s: &mut S,
+    start: u64,
+    len: u64,
+    zeroed: &[Region; MAX_REGIONS],
+    n_zeroed: u64,
+) {
+    if is_prezeroed(zeroed, n_zeroed, start, len) {
+        return;
+    }
     let chunk = if len < 4096 { len } else { 4096 };
     if chunk == 0 {
         return;
@@ -351,7 +398,7 @@ fn clear_dirty<S: Store>(s: &mut S, start: u64, len: u64) {
     let mut i: u64 = 0;
     while i < n {
         let base = start.wrapping_add(i.wrapping_mul(chunk));
-        if !all_zero(s, base, chunk / 8) {
+        if !is_prezeroed(zeroed, n_zeroed, base, chunk) && !all_zero(s, base, chunk / 8) {
             s.zero(base, chunk);
         }
         i += 1;
@@ -712,7 +759,7 @@ fn create_untypeds<S: Store>(s: &mut S, b: &mut Boot, p: &BootParams) {
     let mut i = 0;
     while i < p.n_free && i < MAX_REGIONS as u64 {
         let r = p.free[i as usize];
-        create_untypeds_for_region(s, b, false, r, first);
+        create_untypeds_for_region(s, b, false, r, first, &p.zeroed, p.n_zeroed);
         i += 1;
     }
     // l4h 0047: `untyped` covers the BootInfo's list; the caps described
@@ -791,7 +838,8 @@ mod tests {
     /// The device untypeds `create_untypeds_for_region` makes for `reg`,
     /// with no cut at all.
     fn uncut_untypeds(reg: Region) -> Vec<(u64, u64)> {
-        made(|s, b| create_untypeds_for_region(s, b, true, reg, 0))
+        let no_zeroed = [Region::EMPTY; MAX_REGIONS];
+        made(|s, b| create_untypeds_for_region(s, b, true, reg, 0, &no_zeroed, 0))
     }
 
     fn made(f: impl FnOnce(&mut Mem, &mut Boot)) -> Vec<(u64, u64)> {
@@ -911,5 +959,70 @@ mod tests {
         }
         let reg = Region { start: p - GIB, end: p + GIB };
         assert_eq!(total(&device_untypeds(reg, Region::EMPTY)), 2 * GIB);
+    }
+
+    struct CountingMem {
+        mem: BTreeMap<u64, u64>,
+        reads: core::cell::Cell<u64>,
+        zeros: u64,
+    }
+    impl CountingMem {
+        fn new() -> Self {
+            Self { mem: BTreeMap::new(), reads: core::cell::Cell::new(0), zeros: 0 }
+        }
+    }
+    impl Store for CountingMem {
+        fn read(&self, a: u64) -> u64 {
+            self.reads.set(self.reads.get() + 1);
+            *self.mem.get(&a).unwrap_or(&0)
+        }
+        fn write(&mut self, a: u64, v: u64) {
+            self.mem.insert(a, v);
+        }
+        fn zero(&mut self, a: u64, len: u64) {
+            self.zeros += 1;
+            for i in (0..len).step_by(8) {
+                self.mem.insert(a + i, 0);
+            }
+        }
+        fn clear_free(&mut self, a: u64, len: u64) {
+            self.zero(a, len);
+        }
+        fn ks_base(&self) -> u64 {
+            0x10_0000
+        }
+        fn cur_cpu(&self) -> u64 {
+            0
+        }
+    }
+
+    #[test]
+    fn clear_dirty_skips_prezeroed_regions_in_o1() {
+        let mut s = CountingMem::new();
+        let mut zeroed = [Region::EMPTY; MAX_REGIONS];
+        let base = layout::pptr(0x8000_0000);
+        let size = 32 * GIB;
+        zeroed[0] = Region { start: base, end: base + size };
+        clear_dirty(&mut s, base, size, &zeroed, 1);
+        assert_eq!(s.reads.get(), 0);
+        assert_eq!(s.zeros, 0);
+    }
+
+    #[test]
+    fn clear_dirty_only_reads_and_zeros_non_prezeroed_pages() {
+        let mut s = CountingMem::new();
+        let base = layout::pptr(0x4000_0000);
+        let dtb_page = base + 0x1_0000;
+        let len = 1 << 20; // 1 MiB
+        s.mem.insert(dtb_page + 16, 0xd00d_feed);
+        // Zeroed surrounds the carved-out DTB page.
+        let mut zeroed = [Region::EMPTY; MAX_REGIONS];
+        zeroed[0] = Region { start: base, end: dtb_page };
+        zeroed[1] = Region { start: dtb_page + 4096, end: base + len };
+        clear_dirty(&mut s, base, len, &zeroed, 2);
+        // Only the carved-out DTB page was read (stopping at the first nonzero word) and zeroed.
+        assert_eq!(s.reads.get(), 3);
+        assert_eq!(s.zeros, 1);
+        assert_eq!(*s.mem.get(&(dtb_page + 16)).unwrap(), 0);
     }
 }

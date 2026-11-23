@@ -587,6 +587,8 @@ pub extern "C" fn fl4_boot(magic: u32, info: u32, private_mask: u64, cpuid_page:
     let mut p = BootParams {
         free: [Region::EMPTY; MAX_REGIONS],
         n_free: 0,
+        zeroed: [Region::EMPTY; MAX_REGIONS],
+        n_zeroed: 0,
         device: [Region::EMPTY; MAX_REGIONS],
         n_device: 0,
         ui_p_start: image.p_start,

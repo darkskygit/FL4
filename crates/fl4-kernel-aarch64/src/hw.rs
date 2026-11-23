@@ -804,7 +804,7 @@ fn parse_dt(dtb: u64, hw: &mut Hw) -> bool {
             if p.parent == b"cpus" {
                 // A core's reg is its MPIDR affinity (#address-cells of
                 // /cpus, 1 or 2).
-                if p.node.starts_with(b"cpu@") && (1..=2).contains(&p.ac) && p.len >= p.ac * 4 {
+                if (p.node == b"cpu" || p.node.starts_with(b"cpu@")) && (1..=2).contains(&p.ac) && p.len >= p.ac * 4 {
                     hw.add_cpu(cells(p.val, p.ac) & 0xff_00ff_ffff);
                 }
             } else if !(1..=2).contains(&p.ac) || !(1..=2).contains(&p.sc) || p.len % ((p.ac + p.sc) * 4) != 0 {

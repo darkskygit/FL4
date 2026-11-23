@@ -76,6 +76,12 @@ pub mod mem {
     pub const FIRMWARE: u32 = 2;
     /// Anything else: reserved, unusable, MMIO.
     pub const OTHER: u32 = 3;
+    /// Bit in `MemRegion::cacheable` (alongside bit 0 = write-back RAM):
+    /// every byte of this `FREE` region outside the kernel region, root
+    /// task, boot modules, device tree and TPM event log is already zero
+    /// (for example, freshly mapped anonymous VMM memory the loader never
+    /// wrote to), so boot need not read every page before creating untypeds.
+    pub const ZEROED: u32 = 1 << 1;
 }
 
 #[repr(C)]
@@ -84,7 +90,9 @@ pub struct MemRegion {
     pub base: u64,
     pub len: u64,
     pub kind: u32,
-    /// The region is ordinary write-back cacheable RAM (EFI_MEMORY_WB).
+    /// Bit 0 (`1`): ordinary write-back cacheable RAM (`EFI_MEMORY_WB`).
+    /// Bit 1 (`mem::ZEROED`): untouched bytes of this `FREE` region are
+    /// already zero.
     pub cacheable: u32,
 }
 

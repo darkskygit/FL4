@@ -2541,3 +2541,44 @@ fn ranges_past_the_boot_range_limit_are_reported() {
     assert!(dev < warn);
     assert!(lib.contains("kprintln!(\"FL4: {} device memory regions exceed the boot range limit\", dev.n - MAX_REGIONS);"));
 }
+
+// ---- pre-zeroed RAM & /cpus/cpu ---------------------------------------------------
+
+#[test]
+fn zeroed_bootmem_ranges_carve_out_dtb_and_convert_to_boot_params() {
+    let mut zeroed = bootmem::Ranges::new();
+    zeroed.add(0x4000_0000, 0x8_4000_0000);
+    zeroed.remove(0x4001_0000, 0x4001_1000);
+    assert!(!zeroed.lost);
+    assert_eq!(zeroed.n, 2);
+    assert_eq!(zeroed.r[0], boot::Region { start: 0x4000_0000, end: 0x4001_0000 });
+    assert_eq!(zeroed.r[1], boot::Region { start: 0x4001_1000, end: 0x8_4000_0000 });
+}
+
+#[test]
+fn single_core_dt_cpu_without_unit_address_is_registered() {
+    let mut d = Dtb::default();
+    d.begin("");
+    d.prop_u32("#address-cells", 2);
+    d.prop_u32("#size-cells", 2);
+    d.begin("cpus");
+    d.prop_u32("#address-cells", 1);
+    d.prop_u32("#size-cells", 0);
+    d.begin("cpu");
+    d.prop("reg", &0u32.to_be_bytes());
+    d.end();
+    d.end();
+    d.begin("intc@8000000");
+    d.prop_str("compatible", "arm,gic-v3");
+    d.prop("reg", &reg2(&[GICD, (0x80a_0000, 0xf6_0000)]));
+    d.end();
+    d.end();
+    let blob = d.blob();
+    let mut mem = vec![0u8; BASE as usize + blob.len()];
+    mem[BASE as usize..].copy_from_slice(&blob);
+    layout::MEMORY.set((mem.as_ptr() as u64, mem.len() as u64));
+    let h = hw::discover(0, BASE).expect("device tree");
+    layout::MEMORY.set((0, 0));
+    assert_eq!(h.n_cpus, 1);
+    assert_eq!(h.cpus[0], 0);
+}

@@ -1148,6 +1148,8 @@ impl Sim {
         let mut p = BootParams {
             free: [Region::EMPTY; MAX_REGIONS],
             n_free: 1,
+            zeroed: [Region::EMPTY; MAX_REGIONS],
+            n_zeroed: 0,
             device: [Region::EMPTY; MAX_REGIONS],
             n_device: 2,
             ui_p_start: ui_p,
